@@ -3,7 +3,6 @@
 #include "SPI.h"
 #include <LoRa.h>
 //#include <TeensyTimerTool.h>
-#include <PWMServo.h>
 
 // Hardware Pins
 #define RX_LED_PIN        (31)
@@ -75,6 +74,7 @@
 // Misc Defines
 #define NO_RESET          (-1)
 #define valve_nb          (3) //nombre de valves total
+#define SERIAL_RX_BUF_SIZE (5)
 //#define DIO_QTY           (16)
 //#define AN_QTY            (8)
 
@@ -93,11 +93,7 @@
 #define V_FILL_PIN         (DIO_3_PIN)
 #define V_PURGE_PIN        (DIO_4_PIN)
 
-
-#define SERVO_CLOSE              (60) // Check datasheet to know what value is for what angle
-//#define SERVO_IGNITION           (120)//valeurs d'angle différentes selon si vanne purge ou fill?
-#define SERVO_OPEN               (150)
-
+//taille paquets de données
 #define pack_uart_size            (96) //taille paquet de communication Arduino-Teensy
 #define pack_uart_size_oct        (12) //same, mais en octets
 #define lora_tx_pack_size         (13) //taille du paquet en OCTETS a envoyer a l'operateur pour 99 bits (=etat des 3 valves = 3 bits, loadcells = 4*24 bits = 96)
@@ -134,14 +130,10 @@ bool valve_status[valve_nb] = {0}; //les 3 premiers bits (0, 1, 2)
 
 // Misc Variables
 uint32_t timestamp;
-//uint8_t serial_rx_byte = 0;
-//uint8_t serial_rx_buf[SERIAL_RX_BUF_SIZE];
+uint8_t serial_rx_byte = 0;
+uint8_t serial_rx_buf[SERIAL_RX_BUF_SIZE];
 uint32_t lora_tx_counter = 0;
 
-
-// Servo variables
-PWMServo Vfill5;
-PWMServo Vpurge6;
 
 //other variables
 uint8_t load_cells[pack_uart_size_oct]; //tableau contenant les valeurs des loads cells
@@ -153,8 +145,6 @@ void setup() {
   delay(1000);
 
   lora_init();
-  Vfill5.attach(V_FILL_PIN, 1000, 2000); 
-  Vpurge6.attach(V_PURGE_PIN, 1000, 2000);
   //fermer tt les vannes
   command_parse(LORA_CMD_ABORT);
   //initialize serial communication (pin 46, 47)
@@ -258,7 +248,7 @@ void lora_init(){
   LoRa_tx.setSpreadingFactor(LORA_SF);
 }
 void lora_tx_handler(){
-  // send packet
+  // send pacpacketSizeket
   //Serial.println("TX Handling");
   digitalWrite(TX_LED_PIN, HIGH);
   LoRa_tx.beginPacket();
@@ -294,16 +284,31 @@ void lora_rx_handler(){
 }
 
 void lora_parse(uint8_t *buffer){
-  //Serial.println(buffer[PACKET_ID]);
-  if(buffer[PACKET_ID] == STATUS_PACKET){
-    //status_parse(buffer);
-  }
-  else if(buffer[PACKET_ID] == COMMAND_PACKET){
+  if(buffer[PACKET_ID] == COMMAND_PACKET){
     tone(BUZZER_PIN, 3000, 100);
     delay(50);
     tone(BUZZER_PIN, 4000, 100);
 
-    //command_parse(buffer);
+    uint8_t valves_received = buffer[PACKET_PAYLOAD];
+
+    // Traiter chaque valve en fonction des bits reçus
+    if (valves_received & 0x01)
+      command_parse(LORA_CMD_VQ_D_ON);
+    else
+      command_parse(LORA_CMD_VQ_D_OFF);
+
+    if (valves_received & 0x02)
+      command_parse(LORA_CMD_VFILL_ON);
+    else
+      command_parse(LORA_CMD_VFILL_OFF);
+
+    if (valves_received & 0x04)
+      command_parse(LORA_CMD_VPURGE_ON);
+    else
+      command_parse(LORA_CMD_VPURGE_OFF);
+  }
+  else if(buffer[PACKET_ID] == STATUS_PACKET){
+    //status_parse(buffer); // actuel comportement, laissé tel quel
   }
   else{
     tone(BUZZER_PIN, 3000, 500);
@@ -311,7 +316,6 @@ void lora_parse(uint8_t *buffer){
     tone(BUZZER_PIN, 3000, 500);
   }
 }
-
 /*void analog_read(void){
   analog_status[0] = analogRead(A_0_PIN);
   analog_status[1] = analogRead(A_1_PIN);
@@ -346,19 +350,19 @@ void command_parse(int cmd_nb){
       valve_status[0] = 0;
       break;
     case LORA_CMD_VFILL_ON:
-      Vfill5.write(SERVO_OPEN);
+      set_dio_pin(V_FILL_PIN);
       valve_status[1] = 1;
       break;
     case LORA_CMD_VFILL_OFF:
-      Vfill5.write(SERVO_CLOSE);
+      clear_dio_pin(V_FILL_PIN);
       valve_status[1] = 0;
       break;
     case LORA_CMD_VPURGE_ON:
-      Vpurge6.write(SERVO_OPEN);
+      set_dio_pin(V_PURGE_PIN);
       valve_status[2] = 1;
       break;
     case LORA_CMD_VPURGE_OFF:
-      Vpurge6.write(SERVO_CLOSE);
+      clear_dio_pin(V_PURGE_PIN);
       valve_status[2] = 0;
       break;
     
@@ -366,8 +370,8 @@ void command_parse(int cmd_nb){
       //close all valves
       //appelee dans SETUP!
       clear_dio_pin(V_QUICK_DISC_PIN);
-      Vfill5.write(SERVO_CLOSE);
-      Vpurge6.write(SERVO_CLOSE);
+      clear_dio_pin(V_FILL_PIN);
+      clear_dio_pin(V_PURGE_PIN);
       valve_status[0] = 1;
       valve_status[1] = 1;
       valve_status[2] = 1;
@@ -376,7 +380,6 @@ void command_parse(int cmd_nb){
       return;
   }
 }
-
 void lora_packet_build(void) {
   // On réinitialise le buffer de transmission
   memset(lora_tx_buf, 0, LORA_PACKET_LEN);
@@ -398,7 +401,7 @@ void lora_packet_build(void) {
 }
 
 void lora_send_command(uint8_t command){
-  /*
+  
   //uint32_t i=0;
   digitalWrite(TX_LED_PIN, HIGH);
   //Serial.println(command);
@@ -412,7 +415,7 @@ void lora_send_command(uint8_t command){
   }
   LoRa_tx.endPacket(true);
   digitalWrite(TX_LED_PIN, LOW);
-  */
+  
 }
 
 void set_dio_pin(uint8_t pin){
@@ -421,6 +424,12 @@ void set_dio_pin(uint8_t pin){
   switch(pin){
     case V_QUICK_DISC_PIN:
       valve_status[0] = 1;
+      break;
+    case V_FILL_PIN:
+      valve_status[1] = 1;
+      break;
+    case V_PURGE_PIN:
+      valve_status[2] = 1;
       break;
     default:
       return;
@@ -431,6 +440,12 @@ void clear_dio_pin(uint8_t pin){
   switch(pin){
     case V_QUICK_DISC_PIN:
       valve_status[0] = 0;
+      break;
+    case V_FILL_PIN:
+      valve_status[1] = 0;
+      break;
+    case V_PURGE_PIN:
+      valve_status[2] = 0;
       break;
     default:
       return;
